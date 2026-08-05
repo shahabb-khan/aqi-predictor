@@ -32,14 +32,25 @@ def calculate_aqi_from_pm25(pm25):
     return 500
 
 
-def fetch_training_data():
+def fetch_training_data(max_retries=3):
     print("Connecting to Hopsworks...")
     project = hopsworks.login(api_key_value=HOPSWORKS_KEY)
     fs = project.get_feature_store()
     fg = fs.get_feature_group(name="aqi_features", version=2)
 
-    print("Reading data from Feature Store...")
-    df = fg.read()
+    df = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"Reading data from Feature Store (attempt {attempt}/{max_retries})...")
+            df = fg.read()
+            break
+        except Exception as e:
+            print(f"Read attempt {attempt} failed: {e}")
+            if attempt == max_retries:
+                raise
+            print("Retrying in 30 seconds...")
+            import time
+            time.sleep(30)
 
     # Remove fake test rows
     df = df[df["timestamp"] > 1700000010]
