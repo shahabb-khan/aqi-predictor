@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import hopsworks
 import joblib
+import time
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
@@ -49,14 +50,11 @@ def fetch_training_data(max_retries=3):
             if attempt == max_retries:
                 raise
             print("Retrying in 30 seconds...")
-            import time
             time.sleep(30)
 
-    # Remove fake test rows
     df = df[df["timestamp"] > 1700000010]
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Fix AQI using corrected formula, remove dead-sensor rows
     df = df[df["pm2_5"] > 0].copy()
     df["aqi"] = df["pm2_5"].apply(calculate_aqi_from_pm25)
     df["aqi_change_rate"] = df["aqi"].diff().fillna(0)
@@ -116,8 +114,11 @@ def build_features(df):
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
 
-    # Target: average AQI 49-72 hours ahead (Day 3)
-    df["future_aqi"] = df["aqi"].shift(-72).rolling(window=24, min_periods=24).mean()
+    # CHANGED: instead of one 72h-ahead target, we now build 3 separate targets,
+    # one for each day we want to forecast.
+    df["future_aqi_day1"] = df["aqi"].shift(-24).rolling(window=24, min_periods=24).mean()
+    df["future_aqi_day2"] = df["aqi"].shift(-48).rolling(window=24, min_periods=24).mean()
+    df["future_aqi_day3"] = df["aqi"].shift(-72).rolling(window=24, min_periods=24).mean()
 
     df = df.dropna().reset_index(drop=True)
     print(f"Final feature set: {df.shape[0]} rows")
@@ -135,65 +136,97 @@ def train_and_evaluate(df):
                         "precipitation_sum_24h"]
 
     X = df[feature_columns].values
-    y = df["future_aqi"].values
+
+    # CHANGED: loop over the 3 target columns, train one model per day,
+    # and collect the models + metrics into dictionaries keyed by day number.
+    target_columns = {
+        1: "future_aqi_day1",
+        2: "future_aqi_day2",
+        3: "future_aqi_day3",
+    }
 
     split_idx = int(len(df) * 0.85)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
 
-    print(f"Training on {len(X_train)} rows, testing on {len(X_test)} rows...")
+    models = {}
+    all_metrics = {}
 
-    model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-    model.fit(X_train, y_train)
+    for day, target_col in target_columns.items():
+        print(f"\n--- Training Day {day} model (target: {target_col}) ---")
+        y = df[target_col].values
 
-    predictions = model.predict(X_test)
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y[:split_idx], y[split_idx:]
 
-    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    mae = mean_absolute_error(y_test, predictions)
-    r2 = r2_score(y_test, predictions)
+        print(f"Training on {len(X_train)} rows, testing on {len(X_test)} rows...")
 
-    print("=== Training Complete ===")
-    print(f"RMSE: {rmse:.2f}")
-    print(f"MAE: {mae:.2f}")
-    print(f"R²: {r2:.3f}")
+        model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+        model.fit(X_train, y_train)
 
-    return model, feature_columns, {"rmse": rmse, "mae": mae, "r2": r2}
+        predictions = model.predict(X_test)
+
+        rmse = np.sqrt(mean_squared_error(y_test, predictions))
+        mae = mean_absolute_error(y_test, predictions)
+        r2 = r2_score(y_test, predictions)
+
+        print(f"Day {day} results -> RMSE: {rmse:.2f} | MAE: {mae:.2f} | R²: {r2:.3f}")
+
+        models[day] = model
+        all_metrics[day] = {"rmse": rmse, "mae": mae, "r2": r2}
+
+    return models, feature_columns, all_metrics
 
 
-def save_model_locally(model, feature_columns):
+def save_model_locally(models, feature_columns):
+    # CHANGED: save 3 separate model files instead of 1, plus the shared feature_columns file.
     os.makedirs("models", exist_ok=True)
-    joblib.dump(model, "models/aqi_model.pkl")
+    for day, model in models.items():
+        joblib.dump(model, f"models/aqi_model_day{day}.pkl")
+        print(f"Model for Day {day} saved locally to models/aqi_model_day{day}.pkl")
     joblib.dump(feature_columns, "models/feature_columns.pkl")
-    print("Model saved locally to models/aqi_model.pkl")
 
-def save_model_to_registry(model, feature_columns, metrics, max_retries=3):
+
+def save_model_to_registry(models, feature_columns, all_metrics, max_retries=3):
+    # CHANGED: upload 3 separate registry entries, one per day, each pointing at its own folder.
     print("Connecting to Hopsworks Model Registry...")
     project = hopsworks.login(api_key_value=HOPSWORKS_KEY)
     mr = project.get_model_registry()
 
-    aqi_model = mr.python.create_model(
-        name="aqi_predictor",
-        metrics=metrics,
-        description="Random Forest model predicting AQI 72 hours ahead (3-day average) for Rawalpindi, using pollution + weather + engineered time-series features.",
-    )
+    for day, model in models.items():
+        metrics = all_metrics[day]
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"Uploading model to registry (attempt {attempt}/{max_retries})...")
-            aqi_model.save("models")
-            print("Model saved to Hopsworks Model Registry successfully!")
-            return
-        except Exception as e:
-            print(f"Upload attempt {attempt} failed: {e}")
-            if attempt == max_retries:
-                print("All retry attempts failed. Model is still saved locally in models/aqi_model.pkl")
-            else:
-                print("Retrying...")
+        # Build a small per-day folder so each registry entry only contains its own model file
+        # (plus the shared feature_columns file, needed at prediction time).
+        day_folder = f"models/day{day}_upload"
+        os.makedirs(day_folder, exist_ok=True)
+        joblib.dump(model, os.path.join(day_folder, f"aqi_model_day{day}.pkl"))
+        joblib.dump(feature_columns, os.path.join(day_folder, "feature_columns.pkl"))
+
+        aqi_model = mr.python.create_model(
+            name=f"aqi_predictor_day{day}",
+            metrics=metrics,
+            description=f"Random Forest model predicting AQI for Day {day} ahead for Rawalpindi, "
+                         f"using pollution + weather + engineered time-series features.",
+        )
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"Uploading Day {day} model to registry (attempt {attempt}/{max_retries})...")
+                aqi_model.save(day_folder)
+                print(f"Day {day} model saved to Hopsworks Model Registry successfully!")
+                break
+            except Exception as e:
+                print(f"Upload attempt {attempt} failed: {e}")
+                if attempt == max_retries:
+                    print(f"All retry attempts failed for Day {day}. "
+                          f"Model is still saved locally in {day_folder}/aqi_model_day{day}.pkl")
+                else:
+                    print("Retrying...")
+
 
 if __name__ == "__main__":
     df = fetch_training_data()
     df = add_weather_data(df)
     df = build_features(df)
-    model, feature_columns, metrics = train_and_evaluate(df)
-    save_model_locally(model, feature_columns)
-    save_model_to_registry(model, feature_columns, metrics)
+    models, feature_columns, all_metrics = train_and_evaluate(df)
+    save_model_locally(models, feature_columns)
+    save_model_to_registry(models, feature_columns, all_metrics)
