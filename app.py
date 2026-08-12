@@ -85,7 +85,7 @@ def load_models():
     feature_columns = None
 
     for day in [1, 2, 3]:
-        model_meta = mr.get_model(f"aqi_predictor_day{day}", version=1)
+        model_meta = mr.get_model(f"aqi_predictor_day{day}")
         model_dir = model_meta.download()
         models[day] = joblib.load(os.path.join(model_dir, f"aqi_model_day{day}.pkl"))
         if feature_columns is None:
