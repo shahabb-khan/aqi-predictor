@@ -9,8 +9,17 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
-HOPSWORKS_KEY = os.getenv("HOPSWORKS_API_KEY")
-OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY")
+
+# Works both locally (.env file) and on Streamlit Cloud (st.secrets) —
+# tries st.secrets first, falls back to os.getenv for local runs.
+def get_secret(key):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key)
+
+HOPSWORKS_KEY = get_secret("HOPSWORKS_API_KEY")
+OPENWEATHER_KEY = get_secret("OPENWEATHER_API_KEY")
 
 LAT = 33.6007
 LON = 73.0679
